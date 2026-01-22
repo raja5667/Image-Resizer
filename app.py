@@ -8,7 +8,7 @@ from PyQt6.QtCore import (
     QEasingCurve, QSize
 )
 from PyQt6.QtGui import (
-    QPixmap, QPainter, QPen, QColor, QLinearGradient, QBrush
+    QPixmap, QPainter, QPen, QColor, QLinearGradient, QBrush, QDoubleValidator
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -231,17 +231,26 @@ class ImageResizerPro(QWidget):
             padding: 8px;
             border-radius: 6px;
         """
+        cm_validator = QDoubleValidator(0.1, 1000.0, 2, self)
+        cm_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        
         # Width
         lbl_w = QLabel("Width (cm):")
         self.w_input = QLineEdit("10.0")
+        self.w_input.setValidator(cm_validator)
         self.w_input.setStyleSheet(input_style)
         self.w_input.setFixedWidth(318)
         
         # Height
         lbl_h = QLabel("Height (cm):")
         self.h_input = QLineEdit("15.0")
+        self.h_input.setValidator(cm_validator)
         self.h_input.setStyleSheet(input_style)
         self.h_input.setFixedWidth(318)
+
+        # Enter key navigation
+        self.w_input.returnPressed.connect(self.focus_height)
+        self.h_input.returnPressed.connect(self.focus_width)
         
         # Checkbox (top-right)
         self.cb_apply_all = QCheckBox("")
@@ -426,6 +435,14 @@ class ImageResizerPro(QWidget):
                 self.w_input.blockSignals(False)
             except: pass
         self.save_current_dimensions()
+    
+    def focus_height(self):
+        self.h_input.setFocus()
+        self.h_input.selectAll()
+    
+    def focus_width(self):
+        self.w_input.setFocus()
+        self.w_input.selectAll()
 
     def save_current_dimensions(self):
         w_val = self.w_input.text()
