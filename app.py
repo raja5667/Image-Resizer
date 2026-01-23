@@ -1,16 +1,15 @@
 import sys
 import os
 import re
-import random
-import collections
 import threading
 import speech_recognition as sr
 from pathlib import Path
 from PIL import Image
+from datetime import datetime
 
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, pyqtProperty, QTimer, 
-    QEasingCurve, QSize, pyqtSignal, QObject
+    QEasingCurve, QSequentialAnimationGroup, QSize, pyqtSignal, QObject
 )
 from PyQt6.QtGui import (
     QPixmap, QPainter, QPen, QColor, QLinearGradient, QBrush, QDoubleValidator
@@ -39,8 +38,9 @@ apply_all_keywords = ("apply all", "every image", "select all")
 ratio_keywords = ("ratio", "keep ratio", "aspect", "maintain ratio")
 remove_keywords = ("remove", "delete", "erase", "discard", "remove all")
 pdf_keywords = ("pdf", "document", "export pdf", "a4")
-add_image_keywords = ("image", "add image", "load image", "single image")
+add_image_keywords = ("add image", "load image", "single image")
 add_folder_keywords = ("folder", "add folder", "load folder")
+select_img_keywords = ("img", "image", "photo", "pic", "picture")
 end_keywords = ("stop listening", "exit")
 
 def words_to_number(text):
@@ -55,12 +55,12 @@ def words_to_number(text):
 
 class VoiceSignals(QObject):
     command_received = pyqtSignal(str, float) 
-    status_updated = pyqtSignal(str)
     trigger_process = pyqtSignal()
     add_folder_signal = pyqtSignal()  
     add_image_signal = pyqtSignal()
     stop_voice_signal = pyqtSignal()  
     remove_signal = pyqtSignal(str)
+    select_image_signal = pyqtSignal(int)
 
 class UnifiedCyberPreview(QLabel):
     def __init__(self, parent=None):
@@ -134,11 +134,14 @@ class UnifiedCyberPreview(QLabel):
 # ----------------------------------------------------------------------
 
 class NeonCyberGlowButton(QPushButton):
-    def __init__(self, text, color="#00eaff", parent=None):
+    def __init__(self, text, color="#00eaff", parent=None, hover_glow=False):
         super().__init__(text, parent)
-        self._glow = 20
+        self.hover_glow = hover_glow
+        self.color = color
+
         self.setMinimumHeight(44)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
         self.setStyleSheet(f"""
             QPushButton {{
                 background-color: #0a0a0a;
@@ -149,21 +152,64 @@ class NeonCyberGlowButton(QPushButton):
                 font-size: 15px;
             }}
         """)
+
+        # Glow effect
         self.shadow = QGraphicsDropShadowEffect(self)
         self.shadow.setColor(QColor(color))
-        self.shadow.setBlurRadius(self._glow)
         self.shadow.setOffset(0, 0)
+
+        # 🔑 IMPORTANT
+        self.shadow.setBlurRadius(0 if hover_glow else 20)
         self.setGraphicsEffect(self.shadow)
-        self.anim = QPropertyAnimation(self, b"glow")
-        self.anim.setDuration(300)
 
-    def enterEvent(self, event): self.anim.setEndValue(45); self.anim.start()
-    def leaveEvent(self, event): self.anim.setEndValue(20); self.anim.start()
-    @pyqtProperty(int)
-    def glow(self): return self._glow
-    @glow.setter
-    def glow(self, v): self._glow = v; self.shadow.setBlurRadius(v)
+        # Breathing animation (only used if NOT hover_glow)
+        self.inhale = QPropertyAnimation(self.shadow, b"blurRadius")
+        self.inhale.setDuration(2500)
+        self.inhale.setStartValue(20)
+        self.inhale.setEndValue(50)
+        self.inhale.setEasingCurve(QEasingCurve.Type.InOutSine)
 
+        self.exhale = QPropertyAnimation(self.shadow, b"blurRadius")
+        self.exhale.setDuration(2500)
+        self.exhale.setStartValue(50)
+        self.exhale.setEndValue(20)
+        self.exhale.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+        self.sequence = QSequentialAnimationGroup()
+        self.sequence.addAnimation(self.inhale)
+        self.sequence.addAnimation(self.exhale)
+        self.sequence.setLoopCount(-1)
+
+        # Hover animation (ONLY for hover_glow buttons)
+        self.hover_anim = QPropertyAnimation(self.shadow, b"blurRadius", self)
+        self.hover_anim.setDuration(250)
+        self.hover_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+    def start_breathing(self):
+        if not self.hover_glow and self.sequence.state() != self.sequence.State.Running:
+            self.sequence.start()
+
+    def stop_breathing(self):
+        self.sequence.stop()
+        if not self.hover_glow:
+            self.shadow.setBlurRadius(20)
+
+    def enterEvent(self, event):
+        if self.hover_glow:
+            self.hover_anim.stop()
+            self.hover_anim.setStartValue(self.shadow.blurRadius())
+            self.hover_anim.setEndValue(30)   # soft glow
+            self.hover_anim.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.hover_glow:
+            self.hover_anim.stop()
+            self.hover_anim.setStartValue(self.shadow.blurRadius())
+            self.hover_anim.setEndValue(0)
+            self.hover_anim.start()
+        super().leaveEvent(event)
+    
 class AnimatedGradientButton(QPushButton):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
@@ -210,6 +256,13 @@ class AnimatedGradientButton(QPushButton):
 # MAIN APPLICATION
 # ----------------------------------------------------------------------
 
+def add_text_glow(widget, color="#00eaff", blur=18):
+    glow = QGraphicsDropShadowEffect(widget)
+    glow.setBlurRadius(blur)
+    glow.setColor(QColor(color))
+    glow.setOffset(0, 0)
+    widget.setGraphicsEffect(glow)
+
 class ImageResizerPro(QWidget):
     def __init__(self):
         super().__init__()
@@ -220,11 +273,12 @@ class ImageResizerPro(QWidget):
         self.voice_thread = None
         self.recognizer = sr.Recognizer()
         
+        self.last_voice_cmd = None
+
         self.loaded_files = {} 
         self.ratio = 1.0
-        self.pending_remove = None
         self.setup_ui()
-        
+
     def setup_ui(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -249,8 +303,13 @@ class ImageResizerPro(QWidget):
 
         # Buttons Row
         btn_row = QHBoxLayout()
-        self.btn_add_folder = NeonCyberGlowButton("Add Folder", "#00eaff")
-        self.btn_remove = NeonCyberGlowButton("Remove Selected", "#ff007f")
+        self.btn_add_folder = NeonCyberGlowButton(
+            "Add Folder", "#00eaff", hover_glow=True
+        )
+        
+        self.btn_remove = NeonCyberGlowButton(
+            "Remove Selected", "#ff007f", hover_glow=True
+        )
         
         self.btn_add_folder.clicked.connect(self.load_folder)
         self.btn_remove.clicked.connect(self.remove_selected)
@@ -260,8 +319,6 @@ class ImageResizerPro(QWidget):
         right_layout.addLayout(btn_row)
 
         # --- DIMENSION INPUTS BOX ---
-        input_group = QFrame()
-        input_group.setStyleSheet("background: #111b2d; border-radius: 12px; padding: 10px;")
 
         input_group = QFrame()
         input_group.setStyleSheet("""
@@ -307,15 +364,34 @@ class ImageResizerPro(QWidget):
         self.cb_apply_all = QCheckBox("")
         self.cb_apply_all.setToolTip("Apply same size to all images")
         self.cb_apply_all.setStyleSheet("""
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-                border: 2px solid #00eaff;
-                border-radius: 4px;
-                background: #0a0a0a;
+            QCheckBox {
+                background: transparent;
             }
+            
+            /* checkbox square */
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 2px solid #00eaff;
+                background-color: transparent;
+            }
+            
+            /* hover state */
+            QCheckBox::indicator:hover {
+                background-color: rgba(0, 234, 255, 40);
+                border: 1px solid #00ffff;
+            }
+            
+            /* checked state */
             QCheckBox::indicator:checked {
                 background-color: #00eaff;
+                border: 1px solid #00ffff;
+            }
+            
+            /* pressed state */
+            QCheckBox::indicator:pressed {
+                background-color: rgba(0, 255, 255, 120);
             }
         """)
         
@@ -335,17 +411,67 @@ class ImageResizerPro(QWidget):
         
         right_layout.addWidget(input_group)
 
-        # --- REMAINING CHECKBOXES (Below the box) ---
-        self.cb_ratio = QCheckBox("Maintain Aspect Ratio")
+        # --- Maintain Aspect Ratio Row ---
+        ratio_layout = QHBoxLayout()
+        self.cb_ratio = QCheckBox() # No text here
         self.cb_ratio.setChecked(True)
         
-        self.cb_pdf = QCheckBox("Auto Arrange A4 PDF")
+        lbl_ratio = QLabel("Maintain Aspect Ratio")
+        lbl_ratio.setStyleSheet("color: #cfefff; font-size: 14px; background: transparent;")
+        add_text_glow(lbl_ratio) # Only the text glows!
+        
+        ratio_layout.addWidget(self.cb_ratio)
+        ratio_layout.addWidget(lbl_ratio)
+        ratio_layout.addStretch()
+        right_layout.addLayout(ratio_layout)
+
+        # --- PDF Row ---
+        pdf_layout = QHBoxLayout()
+        self.cb_pdf = QCheckBox() # No text here
         self.cb_pdf.setChecked(True)
         
-        # Apply style and add to the main right panel
+        lbl_pdf = QLabel("Auto Arrange A4 PDF")
+        lbl_pdf.setStyleSheet("color: #cfefff; font-size: 14px; background: transparent;")
+        add_text_glow(lbl_pdf) # Only the text glows!
+        
+        pdf_layout.addWidget(self.cb_pdf)
+        pdf_layout.addWidget(lbl_pdf)
+        pdf_layout.addStretch()
+        right_layout.addLayout(pdf_layout)
+        
+        # --- Apply style to the checkboxes ---
         for cb in [self.cb_ratio, self.cb_pdf]:
-            cb.setStyleSheet("QCheckBox { color: #94a3b8; margin-top: 5px; }")
-            right_layout.addWidget(cb)
+            cb.setStyleSheet("""
+            QCheckBox {
+                background: transparent;
+            }
+            
+            /* checkbox square */
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border-radius: 4px;
+                border: 1px solid #00eaff;
+                background-color: transparent;
+            }
+            
+            /* hover state */
+            QCheckBox::indicator:hover {
+                background-color: rgba(0, 234, 255, 40);
+                border: 1px solid #00ffff;
+            }
+            
+            /* checked state */
+            QCheckBox::indicator:checked {
+                background-color: #00eaff;
+                border: 1px solid #00ffff;
+            }
+            
+            /* pressed state */
+            QCheckBox::indicator:pressed {
+                background-color: rgba(0, 255, 255, 120);
+            }
+            """)
         
         # MULTI-IMAGE LIST
         list_container = QFrame()
@@ -444,10 +570,9 @@ class ImageResizerPro(QWidget):
         if paths:
             self.file_list.setCurrentRow(self.file_list.count() - 1)
             self.on_item_clicked(self.file_list.currentItem())
-            self.btn_run.start_animation()
+            self.update_run_button_state()
 
     def on_item_clicked(self, item):
-        display_name = item.text()
         fname = item.data(Qt.ItemDataRole.UserRole)
         data = self.loaded_files.get(fname)
         if data:
@@ -469,8 +594,6 @@ class ImageResizerPro(QWidget):
     def remove_selected(self):
         current_item = self.file_list.currentItem()
         if current_item:
-            # We need the original filename (without the "1. ") to remove from dictionary
-            # A simple way is to find the data by searching or storing the clean name in item data
             display_text = current_item.text()
             fname = display_text.split(". ", 1)[-1] # Removes the "1. " prefix
             
@@ -480,15 +603,50 @@ class ImageResizerPro(QWidget):
             self.reindex_list() # Refresh numbers for remaining items
             
             if self.file_list.count() == 0:
-                self.preview_area.clear_preview()
-                self.progress.blockSignals(True)
-                self.progress.setValue(0)
-                self.progress.blockSignals(False)
+               self.preview_area.clear_preview()
+               self.progress.blockSignals(True)
+               self.progress.setValue(0)
+               self.progress.blockSignals(False)
+           
+               # 🔹 STOP the glow
+               self.btn_run.stop_animation()
             else:
-                self.file_list.setCurrentRow(0)
-                self.on_item_clicked(self.file_list.currentItem())
-
+               self.file_list.setCurrentRow(0)
+               self.on_item_clicked(self.file_list.currentItem())
+           
+    def update_run_button_state(self):
+        """Glow START button only if images exist"""
+        if self.file_list.count() > 0:
+            self.btn_run.start_animation()
+        else:
+            self.btn_run.stop_animation()
+    
+    def stop_voice_mode(self):
+        if not self.voice_enabled:
+            return
+    
+        print("🛑 Stopping voice mode")
+    
+        self.voice_enabled = False
+    
+        # stop breathing glow
+        self.btn_voice.stop_breathing()
+    
+        # reset button UI
+        self.btn_voice.setChecked(False)
+        self.btn_voice.setText("VOICE MODE OFF")
+        self.btn_voice.setStyleSheet(
+            self.btn_voice.styleSheet().replace("#ef4444", "#22c55e")
+        )
+    
+    def toggle_voice(self, checked):
+        if checked:
+            self.start_voice_mode()
+        else:
+            self.stop_voice_mode()
+    
     def toggle_voice_mode(self):
+        # Initialize signals if not already done
         if not hasattr(self, 'vs'):
             self.vs = VoiceSignals()
             self.vs.command_received.connect(self.safe_ui_update)
@@ -496,8 +654,11 @@ class ImageResizerPro(QWidget):
             self.vs.add_folder_signal.connect(self.load_folder)
             self.vs.add_image_signal.connect(self.load_images) 
             self.vs.remove_signal.connect(self.remove_by_voice)
-            self.vs.stop_voice_signal.connect(self.stop_voice_mode_ui)
+            self.vs.stop_voice_signal.connect(self.stop_voice_mode)
+            self.vs.stop_voice_signal.connect(self.stop_voice_mode) 
+            self.vs.select_image_signal.connect(self.select_image_by_number)
     
+        # Toggle voice mode state
         self.voice_enabled = not self.voice_enabled
     
         if self.voice_enabled:
@@ -505,19 +666,17 @@ class ImageResizerPro(QWidget):
             self.btn_voice.setStyleSheet(
                 self.btn_voice.styleSheet().replace("#22c55e", "#ef4444")
             )
+            self.btn_voice.start_breathing()  # ✅ start glow only when ON
     
-            self.voice_thread = threading.Thread(
-                target=self.voice_loop,
-                daemon=True
-            )
+            self.voice_thread = threading.Thread(target=self.voice_loop, daemon=True)
             self.voice_thread.start()
-    
         else:
             self.btn_voice.setText("VOICE MODE OFF")
             self.btn_voice.setStyleSheet(
                 self.btn_voice.styleSheet().replace("#ef4444", "#22c55e")
             )
-
+            self.btn_voice.stop_breathing()   # ✅ stop glow when OFF
+    
     def voice_loop(self):
         print("🎤 Google Voice Listening")
     
@@ -547,11 +706,24 @@ class ImageResizerPro(QWidget):
                 except Exception as e:
                     print("Voice error:", e)
 
-    def stop_voice_mode_ui(self):
+    def stop_voice_mode(self):
+        if not self.voice_enabled:
+            return
+    
+        print("🛑 Stopping voice mode (FULL STOP)")
+    
         self.voice_enabled = False
+    
+        # 🔥 STOP BREATHING GLOW
+        self.btn_voice.stop_breathing()
+    
+        # reset button
+        self.btn_voice.setChecked(False)
         self.btn_voice.setText("VOICE MODE OFF")
-        self.btn_voice.setStyleSheet(self.btn_voice.styleSheet().replace("#ef4444", "#22c55e"))
-        print("🎤 Voice assistant stopped by user.")
+        self.btn_voice.setStyleSheet(
+            self.btn_voice.styleSheet().replace("#ef4444", "#22c55e")
+        )
+    
     
     def remove_by_voice(self, param):
         """
@@ -562,10 +734,13 @@ class ImageResizerPro(QWidget):
             self.loaded_files.clear()
             self.file_list.clear()
             self.preview_area.clear_preview()
-
+        
             self.progress.blockSignals(True)
             self.progress.setValue(0)
             self.progress.blockSignals(False)
+        
+            # 🔹 STOP the glow
+            self.btn_run.stop_animation()
             return
     
         # Try to remove by number
@@ -599,16 +774,40 @@ class ImageResizerPro(QWidget):
                 else:
                     self.preview_area.clear_preview()
                     self.progress.setValue(0)
+        self.update_run_button_state()                
 
-    def parse_voice_command(self, text):
+    def select_image_by_number(self, number):
+        """Select the image by its index (1-based)"""
+        index = number - 1
+        if 0 <= index < self.file_list.count():
+            self.file_list.setCurrentRow(index)
+            self.on_item_clicked(self.file_list.currentItem())
+            print(f"🎯 Selected image #{number}")
+
+    def set_checkbox_state(self, checkbox, text):
         text = text.lower()
+        text = text.replace(" of", " off")  # fix "of" → "off"
+    
+        if "off" in text:
+            if checkbox.isChecked():
+                checkbox.setChecked(False)
+                return True
+        elif "on" in text or any(k in text for k in apply_all_keywords):
+            if not checkbox.isChecked():
+                checkbox.setChecked(True)
+                return True
+    
+        return False
+    
+    def parse_voice_command(self, text):
+        text = text.lower().strip()
         print("🧠 Parsing:", text)
     
-        # Extract numeric value
+        # ---------- EXTRACT NUMERIC VALUE FOR WIDTH/HEIGHT ----------
         nums = re.findall(r"\d+\.?\d*", text)
         value = float(nums[0]) if nums else None
         if value is None:
-            value = words_to_number(text)
+            value = words_to_number(text)  # Only for width/height commands
     
         # ---------- WIDTH ----------
         if any(k in text for k in width_keywords):
@@ -631,53 +830,64 @@ class ImageResizerPro(QWidget):
             self.vs.trigger_process.emit()
             self.last_voice_cmd = None
     
-        # ---------- APPLY ALL ON/OFF ----------
+        # ---------- CHECKBOX COMMANDS ----------
         elif any(k in text for k in apply_all_keywords):
-            self.cb_apply_all.setChecked(not self.cb_apply_all.isChecked())
-            self.save_current_dimensions()  # update all loaded files
-        
-        # ---------- RATIO ON/OFF ----------
+            changed = self.set_checkbox_state(self.cb_apply_all, text)
+            if changed:
+                self.save_current_dimensions()
+    
         elif any(k in text for k in ratio_keywords):
-            self.cb_ratio.setChecked(not self.cb_ratio.isChecked())
-            if self.file_list.currentItem():
+            changed = self.set_checkbox_state(self.cb_ratio, text)
+            if changed and self.file_list.currentItem():
                 self.sync_height()
-        
-        # ---------- PDF ON/OFF ----------
+    
         elif any(k in text for k in pdf_keywords):
-            self.cb_pdf.setChecked(not self.cb_pdf.isChecked())
- 
+            self.set_checkbox_state(self.cb_pdf, text)
+    
         # ---------- REMOVE IMAGE(S) ----------
         elif any(k in text for k in remove_keywords):
             if "all" in text:
                 self.vs.remove_signal.emit("all")
             elif value is not None:
-                # Use the 'value' we already found at the top of this function!
                 self.vs.remove_signal.emit(str(int(value)))
             else:
-                # Fallback to removing current selection if no number was heard
                 self.vs.remove_signal.emit("")
-            
-            self.last_voice_cmd = None # Clear memory
-
+            self.last_voice_cmd = None
+    
         # ---------- ADD FOLDER ----------
         elif any(k in text for k in add_folder_keywords):
-            self.vs.add_folder_signal.emit()  
-
+            self.vs.add_folder_signal.emit()
+    
         # ---------- ADD IMAGE ----------
         elif any(k in text for k in add_image_keywords):
-            self.vs.add_image_signal.emit() 
-        
+            self.vs.add_image_signal.emit()
+    
+        # ---------- SELECT IMAGE BY NUMBER (DIGITS ONLY) ----------
+        else:
+            selected = False
+            for kw in select_img_keywords:
+                # Match keyword optionally followed by a dot, then space(s), then digits
+                pattern = rf"{kw}\.?\s+(\d+)"
+                match = re.search(pattern, text)
+                if match:
+                    num = int(match.group(1))
+                    self.vs.select_image_signal.emit(num)
+                    selected = True
+                    break
+            if selected:
+                return
+    
         # ---------- END / STOP ASSISTANT ----------
-        elif any(k in text for k in end_keywords):
-            self.vs.stop_voice_signal.emit() 
+        if any(k in text for k in end_keywords):  
+            self.vs.stop_voice_signal.emit()
+            return
     
         # ---------- ONLY NUMBER GIVEN, USE LAST COMMAND ----------
+        elif value is not None and getattr(self, "last_voice_cmd", None):
+            self.vs.command_received.emit(self.last_voice_cmd, value)
+            self.last_voice_cmd = None
         else:
-            if value is not None and getattr(self, "last_voice_cmd", None):
-                self.vs.command_received.emit(self.last_voice_cmd, value)
-                self.last_voice_cmd = None
-            else:
-                print("⚠ Ignored unrelated speech")
+            print("⚠ Ignored unrelated speech")
     
     def safe_ui_update(self, cmd_type, value):
         """This runs on the MAIN UI thread, making it 100% safe."""
@@ -687,8 +897,6 @@ class ImageResizerPro(QWidget):
         elif cmd_type == "height":
             self.h_input.setText(str(value))
             self.sync_width()
-        elif cmd_type == "apply_all":
-            self.cb_apply_all.setChecked(True)
 
     def reindex_list(self):
         for i in range(self.file_list.count()):
@@ -825,8 +1033,9 @@ class ImageResizerPro(QWidget):
                 print(f"Failed to process {fname}: {e}")
     
         if only_pdf and images_data_for_pdf:
-            pdf_path = output_dir / "ImageResizer_Export.pdf"
-            # Pass the rich data list to the PDF function
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            pdf_path = output_dir / f"ImageResizer_{timestamp}.pdf"
+        
             self.generate_a4_pdf(images_data_for_pdf, str(pdf_path))
             
             for img_info in images_data_for_pdf:
@@ -862,10 +1071,9 @@ class ImageResizerPro(QWidget):
         self.progress.setValue(0)
         self.progress.blockSignals(False)
 
-        self.btn_run.stop_animation()
+        self.update_run_button_state()
     
         self.ratio = 1.0
-        self.pending_remove = None
     
         print("🔄 UI reset after 8 seconds (voice untouched)")
 
@@ -873,4 +1081,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = ImageResizerPro()
     window.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec()) 
