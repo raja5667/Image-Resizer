@@ -943,7 +943,7 @@ class ImageResizerPro(QWidget):
         else:
             item = self.file_list.currentItem()
             if item:
-                fname = item.data(Qt.ItemDataRole.UserRole)  # ✅ FIX
+                fname = item.data(Qt.ItemDataRole.UserRole)
                 if fname in self.loaded_files:
                     self.loaded_files[fname]["width"] = w_val
                     self.loaded_files[fname]["height"] = h_val

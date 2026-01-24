@@ -1,0 +1,12 @@
+# PyInstaller
+dist/
+build/
+*.exe
+*.pkg
+*.spec
+PYZ-*
+EXE-*
+PKG-*
+
+# Virtual environment
+resizer_env/
